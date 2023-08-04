@@ -25,6 +25,7 @@
  * SUCH DAMAGE.
  */
 
+#include <assert.h>
 #include <fcntl.h>
 #include <inttypes.h>
 #include <stdint.h>
@@ -49,6 +50,10 @@
 
 #define	DPRINTF(...) printf("backend_bt: " __VA_ARGS__)
 
+enum {
+	aptxhd_rtp_hdr_size = 12,
+};
+
 struct l2cap_info {
 	bdaddr_t laddr;
 	bdaddr_t raddr;
@@ -58,11 +63,17 @@ static struct bt_config bt_play_cfg;
 static struct bt_config bt_rec_cfg;
 
 static int
-bt_set_format(int *format)
+bt_set_format(int *format, struct bt_config *cfg)
 {
 	int value;
+	int want = AFMT_S16_NE;
 
-	value = *format & AFMT_S16_NE;
+#ifdef HAVE_APTX
+	if (cfg->codec == CODEC_APTX || cfg->codec == CODEC_APTXHD)
+		want = AFMT_S24_LE;
+#endif
+
+	value = *format & want;
 	if (value != 0) {
 		*format = value;
 		return (0);
@@ -439,10 +450,6 @@ retry:
 
 	cfg->bitpool = tmpbitpool;
 
-	if (bt_set_format(pformat)) {
-		DPRINTF("Unsupported sample format\n");
-		goto error;
-	}
 	l2cap_psm = bt_query(&info, service_class);
 	DPRINTF("PSM=0x%02x\n", l2cap_psm);
 	if (l2cap_psm < 0) {
@@ -476,6 +483,10 @@ retry:
 	}
 	if (avdtpDiscoverAndConfig(cfg, isSink)) {
 		DPRINTF("DISCOVER FAILED\n");
+		goto error;
+	}
+	if (bt_set_format(pformat,  cfg)) {
+		DPRINTF("Unsupported sample format\n");
 		goto error;
 	}
 	if (avdtpOpen(cfg->hc, cfg->sep)) {
@@ -563,6 +574,10 @@ error:
 		close(cfg->fd);
 		cfg->fd = -1;
 	}
+	if (cfg->lsdphdl) {
+		sdp_close(cfg->lsdphdl);
+		cfg->lsdphdl = NULL;
+	}
 	return (-1);
 }
 
@@ -611,6 +626,58 @@ bt_play_open(struct voss_backend *pbe, const char *devname, int samplerate,
 			return (-1);
 		memset(cfg->handle.sbc_enc, 0, sizeof(*cfg->handle.sbc_enc));
 		break;
+#ifdef HAVE_APTX
+	case CODEC_APTXHD: {
+		cfg->handle.aptx_ctx = aptx_init(1);
+		if (cfg->handle.aptx_ctx == NULL)
+			return (-1);
+
+		/* Prepare the input buffer:
+		 *
+		 * For aptX-HD the compression ratio is 4:1. */
+		size_t const rtp_hdr_size = aptxhd_rtp_hdr_size;
+		size_t const payload_size = cfg->mtu - rtp_hdr_size;
+		size_t const aptxhd_frames = payload_size / 6;
+		size_t const inbuf_size = aptxhd_frames * 4 * 6;
+
+		DPRINTF("aptX-HD input: rtp_hdr_size = %zu, payload_size = %zu, "
+		        "aptx_frames = %zu, input_size = %zu\n",
+		        rtp_hdr_size, payload_size, aptxhd_frames, inbuf_size);
+
+		cfg->rem_in_size = inbuf_size;
+		cfg->rem_in_len = cfg->rem_in_size;
+		cfg->rem_in_data = calloc(1, inbuf_size);
+		if (cfg->rem_in_data == NULL) {
+			DPRINTF("Calloc failed: %s\n", strerror(errno));
+			return (-1);
+		}
+	} break;
+	case CODEC_APTX: {
+		cfg->handle.aptx_ctx = aptx_init(0);
+		if (cfg->handle.aptx_ctx == NULL)
+			return (-1);
+
+		/* Prepare the input buffer:
+		 *
+		 * For regular aptX the compression ratio is 6:1. */
+		size_t const rtp_hdr_size = 0; //aptx_rtp_hdr_size;
+		size_t const payload_size = cfg->mtu - rtp_hdr_size;
+		size_t const aptx_frames = payload_size / 4;
+		size_t const inbuf_size = aptx_frames * 4 * 6;
+
+		DPRINTF("aptX input: rtp_hdr_size = %zu, payload_size = %zu, "
+		        "aptx_frames = %zu, input_size = %zu\n",
+		        rtp_hdr_size, payload_size, aptx_frames, inbuf_size);
+
+		cfg->rem_in_size = inbuf_size;
+		cfg->rem_in_len = cfg->rem_in_size;
+		cfg->rem_in_data = calloc(1, inbuf_size);
+		if (cfg->rem_in_data == NULL) {
+			DPRINTF("Calloc failed: %s\n", strerror(errno));
+			return (-1);
+		}
+	} break;
+#endif
 #ifdef HAVE_FFMPEG
 	case CODEC_AAC:
 		av_register_all();
@@ -1077,6 +1144,151 @@ bt_play_aac_transfer(struct voss_backend *pbe, void *ptr, int len)
 
 #endif
 
+#ifdef HAVE_APTX
+static int
+bt_play_aptxhd_transfer(struct voss_backend *pbe, void *ptr, int len)
+{
+	struct aptxhd_header {
+		uint8_t	id;
+		uint8_t	id2;
+		uint8_t	seqnumMSB;
+		uint8_t	seqnumLSB;
+		uint8_t	ts3;
+		uint8_t	ts2;
+		uint8_t	ts1;
+		uint8_t	ts0;
+		uint8_t ssrc3;
+		uint8_t ssrc2;
+		uint8_t ssrc1;
+		uint8_t ssrc0;
+	} __packed;
+
+	static_assert(sizeof(struct aptxhd_header) == aptxhd_rtp_hdr_size,
+	              "aptxhd_header struct is wrong");
+
+	struct bt_config *cfg = pbe->arg;
+
+	while (len > 0) {
+
+		/* Prepare audio input buffer */
+		uint32_t rem_free = cfg->rem_in_len;
+		uint32_t to_copy = len > rem_free ? rem_free : len;
+		memcpy(cfg->rem_in_data + (cfg->rem_in_size - cfg->rem_in_len),
+		       ptr,
+		       to_copy);
+
+		cfg->rem_in_len -= to_copy;
+
+		len -= to_copy;
+		ptr += to_copy;
+
+		/* Check if buffer is full and we can send a frame */
+		if (cfg->rem_in_len == 0) {
+			struct aptxhd_header *phdr = (struct aptxhd_header *)cfg->mtu_data;
+			int rem, xlen;
+
+			phdr->id = 0x80;/* RTP v2 */
+			phdr->id2 = 0x60;	/* payload type 96. */
+			phdr->seqnumMSB = (uint8_t)(cfg->mtu_seqnumber >> 8);
+			phdr->seqnumLSB = (uint8_t)(cfg->mtu_seqnumber);
+			phdr->ts3 = (uint8_t)(cfg->mtu_timestamp >> 24);
+			phdr->ts2 = (uint8_t)(cfg->mtu_timestamp >> 16);
+			phdr->ts1 = (uint8_t)(cfg->mtu_timestamp >> 8);
+			phdr->ts0 = (uint8_t)(cfg->mtu_timestamp);
+			phdr->ssrc3 = 1;
+			phdr->ssrc2 = 0;
+			phdr->ssrc1 = 0;
+			phdr->ssrc0 = 0;
+
+			cfg->mtu_seqnumber++;
+
+			rem = cfg->mtu - sizeof(*phdr);
+			cfg->mtu_offset = sizeof(*phdr);
+
+			size_t written = 0;
+			size_t processed = aptx_encode(cfg->handle.aptx_ctx,
+			                               cfg->rem_in_data, cfg->rem_in_size,
+			                               cfg->mtu_data + cfg->mtu_offset,
+			                               rem,
+			                               &written);
+
+			cfg->mtu_offset += written;
+			rem -= written;
+
+			cfg->mtu_timestamp += cfg->rem_in_size / 2;
+
+			do {
+				xlen = write(cfg->fd, cfg->mtu_data, cfg->mtu_offset);
+			} while (xlen < 0 && errno == EAGAIN);
+
+			if (xlen < 0) {
+				DPRINTF("%s: write fail: %s.\n",
+				        __func__, strerror(errno));
+				return (-1);
+			}
+
+			/* Reset */
+			cfg->rem_in_len = cfg->rem_in_size;
+		}
+	}
+	return (0);
+}
+
+static int
+bt_play_aptx_transfer(struct voss_backend *pbe, void *ptr, int len)
+{
+	struct bt_config *cfg = pbe->arg;
+	assert(cfg->rem_in_size % 4 == 0);
+
+	while (len > 0) {
+
+		/* Prepare audio input buffer */
+		uint32_t rem_free = cfg->rem_in_len;
+		uint32_t to_copy = len > rem_free ? rem_free : len;
+		memcpy(cfg->rem_in_data + (cfg->rem_in_size - cfg->rem_in_len),
+		       ptr,
+		       to_copy);
+
+		cfg->rem_in_len -= to_copy;
+
+		len -= to_copy;
+		ptr += to_copy;
+
+		/* Check if buffer is full and we can send a frame */
+		if (cfg->rem_in_len == 0) {
+			int rem, xlen;
+
+			rem = cfg->mtu;
+			cfg->mtu_offset = 0;
+
+			size_t written = 0;
+			size_t processed = aptx_encode(cfg->handle.aptx_ctx,
+			                               cfg->rem_in_data, cfg->rem_in_size,
+			                               cfg->mtu_data + cfg->mtu_offset,
+			                               rem,
+			                               &written);
+
+			cfg->mtu_offset += written;
+			rem -= written;
+
+			do {
+				xlen = write(cfg->fd, cfg->mtu_data, cfg->mtu_offset);
+			} while (xlen < 0 && errno == EAGAIN);
+
+			if (xlen < 0) {
+				DPRINTF("%s: write fail: %s.\n",
+				        __func__, strerror(errno));
+				return (-1);
+			}
+
+			/* Reset */
+			cfg->rem_in_len = cfg->rem_in_size;
+		}
+	}
+	return (0);
+}
+#endif
+
 static int
 bt_play_transfer(struct voss_backend *pbe, void *ptr, int len)
 {
@@ -1085,6 +1297,12 @@ bt_play_transfer(struct voss_backend *pbe, void *ptr, int len)
 	switch (cfg->codec) {
 	case CODEC_SBC:
 		return (bt_play_sbc_transfer(pbe, ptr, len));
+#ifdef HAVE_APTX
+	case CODEC_APTX:
+		return (bt_play_aptx_transfer(pbe, ptr, len));
+	case CODEC_APTXHD:
+		return (bt_play_aptxhd_transfer(pbe, ptr, len));
+#endif
 #ifdef HAVE_FFMPEG
 	case CODEC_AAC:
 		return (bt_play_aac_transfer(pbe, ptr, len));

@@ -32,6 +32,10 @@
 #include <libavutil/opt.h>
 #endif
 
+#ifdef HAVE_APTX
+#include <openaptx.h>
+#endif
+
 #include "sbc_encode.h"
 
 struct bt_config {
@@ -64,6 +68,8 @@ struct bt_config {
 	uint8_t	codec;
 #define	CODEC_SBC 0x00
 #define	CODEC_AAC 0x02
+#define CODEC_APTX 0x03
+#define CODEC_APTXHD 0x04
 	uint8_t	aacMode1;
 	uint8_t	aacMode2;
 
@@ -71,13 +77,16 @@ struct bt_config {
 	union {
 #ifdef HAVE_FFMPEG
 		struct {
-			AVCodec *codec;
+			AVCodec *codec;p
 			AVCodecContext *context;
 			AVFormatContext *format;
 			AVFrame *frame;
 			AVStream *stream;
 		} av;
 #endif
+#ifdef HAVE_APTX
+		struct aptx_context *aptx_ctx;
+#endif /* APTX */
 		struct sbc_encode *sbc_enc;
 	}	handle;
 
