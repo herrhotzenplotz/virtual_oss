@@ -96,6 +96,10 @@ bt_close(struct voss_backend *pbe)
 		close(cfg->fd);
 		cfg->fd = -1;
 	}
+	if (cfg->lsdphdl != NULL) {
+		sdp_close(cfg->lsdphdl);
+		cfg->lsdphdl = NULL;
+	}
 }
 
 static void
