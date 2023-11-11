@@ -32,13 +32,15 @@
  * POSSIBILITY OF SUCH DAMAGE.
  */
 
-#include <stdio.h>
 #include <errno.h>
+#include <inttypes.h>
+#include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 #include <unistd.h>
 
 #include <sys/uio.h>
+#include <sys/endian.h>
 
 #include "avdtp_signal.h"
 #include "backend_bt.h"
@@ -388,6 +390,8 @@ avdtpAutoConfig(struct bt_config *cfg)
 	uint8_t aacBitrate3 = 0;
 	uint8_t aacBitrate4 = 0;
 	uint8_t aacBitrate5 = 0;
+	uint8_t aptx_cap = 0;
+	uint8_t aptxhd_cap = 0;
 	int retval;
 	int i;
 
@@ -396,6 +400,7 @@ avdtpAutoConfig(struct bt_config *cfg)
 		DPRINTF("Cannot get capabilities\n");
 		return (retval);
 	}
+
 retry:
 	for (i = 0; (i + 1) < info.buffer_len;) {
 #if 0
@@ -433,6 +438,29 @@ retry:
 				aacBitrate4 = info.buffer_data[i + 8];
 				aacBitrate5 = info.buffer_data[i + 9];
 				break;
+			case 0xff: {
+				uint32_t vid;
+				uint16_t cid;
+				int n = i + 4;
+
+				vid = le32dec(info.buffer_data + n);
+				n += sizeof(vid);
+				cid = le16dec(info.buffer_data + n);
+				n += sizeof(cid);
+				DPRINTF("Vendor codec: Vendor = 0x%"
+				        PRIx32", Codec = 0x%"
+				        PRIx16"\n",
+				        vid, cid);
+				if (vid == 0xd7 && cid == 0x24) /* aptX-HD */ {
+					aptxhd_cap = info.buffer_data[n];
+					n += sizeof(aptxhd_cap);
+					DPRINTF("aptX-HD cap = 0x%x\n", aptx_cap);
+				} else if (vid == 0x4f && cid == 0x01) /* aptX */ {
+					aptx_cap = info.buffer_data[n];
+					n += sizeof(aptx_cap);
+					DPRINTF("aptX cap = 0x%x\n", aptx_cap);
+				}
+			} break;
 			default:
 				break;
 			}
@@ -458,7 +486,73 @@ retry:
 		}
 #endif
 	}
-	/* Try SBC second */
+	/* Try aptX-HD and regular aptX */
+#ifdef HAVE_APTX
+	if (aptxhd_cap != 0) {
+		uint8_t chans = (aptxhd_cap & 0xf);
+		uint8_t fmodes = (aptxhd_cap & 0xf0) >> 4;
+
+		freqmode = FREQ_UNDEFINED;
+		if ((fmodes & 0x1) && (cfg->freq == FREQ_48K)) {
+			freqmode = FREQ_48K;
+			aptxhd_cap &= (~0x20);
+		} else if ((fmodes & 0x2) && (cfg->freq == FREQ_44_1K)) {
+			freqmode = FREQ_44_1K;
+			aptxhd_cap &= (~0x10);
+		}
+
+		if (freqmode != FREQ_UNDEFINED) {
+			uint8_t config[4 + 9 + 4] = {
+				mediaTransport, 0x0, mediaCodec, 9 + 4,
+				0x00, 0xFF,
+				0xd7, 0x00, 0x00, 0x00,
+				0x24, 0x00,
+			        aptxhd_cap,
+				0x00, 0x00, 0x00, 0x00,
+			};
+			DPRINTF("Attempting to configure aptX-HD\n");
+			if (avdtpSetConfiguration
+			    (cfg->hc, cfg->sep, config, sizeof(config)) == 0) {
+				cfg->codec = CODEC_APTXHD;
+				DPRINTF("Now using aptX-HD\n");
+				return (0);
+			}
+			DPRINTF("Failed to configure aptX-HD\n");
+		}
+	}
+	if (aptx_cap != 0) {
+		uint8_t chans = (aptx_cap & 0xf);
+		uint8_t fmodes = (aptx_cap & 0xf0) >> 4;
+
+		freqmode = FREQ_UNDEFINED;
+		if ((fmodes & 0x1) && (cfg->freq == FREQ_48K)) {
+			freqmode = FREQ_48K;
+			aptx_cap &= (~0x20);
+		} else if ((fmodes & 0x2) && (cfg->freq == FREQ_44_1K)) {
+			freqmode = FREQ_44_1K;
+			aptx_cap &= (~0x10);
+		}
+
+		if (freqmode != FREQ_UNDEFINED) {
+			uint8_t config[4 + 9] = {
+				mediaTransport, 0x0, mediaCodec, 9,
+				0x00, 0xFF,
+				0x4F, 0x00, 0x00, 0x00,
+				0x01, 0x00,
+			        aptx_cap,
+			};
+			DPRINTF("Attempting to configure aptX\n");
+			if (avdtpSetConfiguration
+			    (cfg->hc, cfg->sep, config, sizeof(config)) == 0) {
+				cfg->codec = CODEC_APTX;
+				DPRINTF("Now using aptX\n");
+				return (0);
+			}
+			DPRINTF("Failed to configure aptX\n");
+		}
+	}
+#endif /* HAVE_APTX */
+	/* Try SBC third */
 	if (cfg->freq == FREQ_UNDEFINED)
 		goto auto_config_failed;
 

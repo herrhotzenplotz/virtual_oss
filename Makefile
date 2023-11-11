@@ -94,6 +94,11 @@ CFLAGS += -DHAVE_FFMPEG
 LDFLAGS += -lavdevice -lavutil -lavcodec -lavresample -lavformat
 .endif
 
+.if defined(HAVE_APTX)
+CFLAGS += -DHAVE_APTX -Ibackend_bt/libopenaptx
+SRCS += backend_bt/libopenaptx/openaptx.c
+.endif
+
 .if defined(HAVE_HTTPD)
 SRCS += virtual_httpd.c
 CFLAGS += -DHAVE_HTTPD
