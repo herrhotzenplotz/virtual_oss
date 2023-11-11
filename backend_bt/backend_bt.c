@@ -25,11 +25,12 @@
  * SUCH DAMAGE.
  */
 
-#include <stdio.h>
+#include <fcntl.h>
+#include <inttypes.h>
 #include <stdint.h>
+#include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
-#include <fcntl.h>
 #include <unistd.h>
 #include <err.h>
 #define	L2CAP_SOCKET_CHECKED
@@ -237,7 +238,8 @@ bt_query(struct l2cap_info *info, uint16_t service_class)
 
 	ss = sdp_open(&info->laddr, &info->raddr);
 	if (ss == NULL || sdp_error(ss) != 0) {
-		DPRINTF("Could not open SDP\n");
+		DPRINTF("Could not open SDP: %s\n",
+		        ss ? strerror(sdp_error(ss)) : "cannot alloc memory");
 		sdp_close(ss);
 		return (psm);
 	}
@@ -267,6 +269,46 @@ bt_query(struct l2cap_info *info, uint16_t service_class)
 done:
 	sdp_close(ss);
 	return (psm);
+}
+
+static void *
+bt_advertise_audio_service(uint16_t const service_class, uint16_t const psm)
+{
+	void *sdp_hdl;
+	uint32_t hdl = 0;
+	int32_t rc;
+	struct sdp_audio_source_profile profile = {
+		.psm = SDP_UUID_PROTOCOL_AVDTP,
+		.protover = 0x0103, /* version 1.3 */
+		.features = 0,
+	};
+	uint16_t const sc =
+		service_class == SDP_SERVICE_CLASS_AUDIO_SINK
+		? SDP_SERVICE_CLASS_AUDIO_SOURCE
+		: SDP_SERVICE_CLASS_AUDIO_SINK;
+
+	sdp_hdl = sdp_open_local(NULL); /* TODO: accept path to local sdpd socket */
+	if (!sdp_hdl) {
+		DPRINTF("Could not connect to local SDP daemon\n");
+		return (NULL);
+	}
+
+	DPRINTF("Registering SDP service: PSM = 0x%"PRIx16", SC = 0x%"PRIx16"\n",
+	        profile.psm, sc);
+
+	rc = sdp_register_service(
+		sdp_hdl, sc, NG_HCI_BDADDR_ANY,
+		(uint8_t const *)&profile, sizeof(profile),
+		&hdl);
+	if (rc) {
+		DPRINTF("Could not register service with SDP daemon\n");
+		sdp_close(sdp_hdl);
+		return (NULL);
+	}
+
+	DPRINTF("SDP Handle = 0x%"PRIx32"\n", hdl);
+
+	return sdp_hdl;
 }
 
 static int
@@ -419,6 +461,11 @@ retry:
 
 	if (bind(cfg->hc, (struct sockaddr *)&addr, sizeof(addr)) < 0) {
 		DPRINTF("Could not bind to HC\n");
+		goto error;
+	}
+	cfg->lsdphdl = bt_advertise_audio_service(service_class, addr.l2cap_psm);
+	if (cfg->lsdphdl == NULL) {
+		DPRINTF("Could not register audio service\n");
 		goto error;
 	}
 	bdaddr_copy(&addr.l2cap_bdaddr, &info.raddr);

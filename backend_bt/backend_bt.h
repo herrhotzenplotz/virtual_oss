@@ -106,6 +106,7 @@ struct bt_config {
 #define	acpStreamStarted 4
 #define	acpStreamSuspended 5
 #define	acpStreamClosed 6
+	void *lsdphdl;          /* local sdpd handle */
 };
 
 size_t	sbc_encode_frame(struct bt_config *);
